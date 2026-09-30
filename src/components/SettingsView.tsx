@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Save, CheckCircle2 } from 'lucide-react';
+import { Save, CheckCircle2, AlertTriangle, Shield } from 'lucide-react';
 import { Business } from '../types.ts';
 
 interface SettingsViewProps {
@@ -36,11 +36,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   );
   const [saving, setSaving] = useState(false);
   const [savedNotice, setSavedNotice] = useState(false);
+  const [validationError, setValidationError] = useState<string | null>(null);
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     setSaving(true);
     setSavedNotice(false);
+    setValidationError(null);
     try {
       const res = await fetch('/api/settings', {
         method: 'PUT',
@@ -60,10 +62,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           retryLinkExpiryHours: Number(retryLinkExpiryHours),
         }),
       });
-      if (res.ok) {
-        await onRefresh();
-        setSavedNotice(true);
+      const data = await res.json();
+      if (!res.ok) {
+        setValidationError(data.error || 'Settings validation failed');
+        return;
       }
+      await onRefresh();
+      setSavedNotice(true);
+    } catch (err: unknown) {
+      setValidationError(
+        err instanceof Error ? err.message : 'Failed to save settings'
+      );
     } finally {
       setSaving(false);
     }
@@ -74,7 +83,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       <div className="border border-slate-800 bg-slate-900 p-6 space-y-6">
         <div className="border-b border-slate-800 pb-4">
           <h2 className="text-lg font-semibold text-white">
-            03. Multi-Tenant Business Profile & Provider Adapters
+            03. Multi-Tenant Business Profile & Validated Provider Settings
           </h2>
           <p className="mt-1 text-xs text-slate-400">
             Tenant ID:{' '}
@@ -90,10 +99,33 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </p>
         </div>
 
+        {/* Tenant-Bound Webhook URLs (Objective 6) */}
+        <div className="border border-slate-800 bg-slate-950 p-4 space-y-2 text-xs">
+          <div className="flex items-center gap-2 text-emerald-400 font-medium">
+            <Shield className="h-4 w-4" />
+            <span>
+              Cryptographic Tenant-Scoped Webhook Endpoints (Objective 6 Hardened)
+            </span>
+          </div>
+          <p className="text-slate-400">
+            Configure these tenant-isolated URLs in your Paystack and Flutterwave
+            dashboards. Unverified <span className="font-mono-tabular">businessId</span>{' '}
+            fields in request bodies are never trusted.
+          </p>
+          <div className="space-y-1 font-mono-tabular text-slate-200 pt-1">
+            <div>
+              Paystack: POST /api/v1/webhooks/paystack/{business.webhookToken}
+            </div>
+            <div>
+              Flutterwave: POST /api/v1/webhooks/flutterwave/{business.webhookToken}
+            </div>
+          </div>
+        </div>
+
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-5 text-xs">
           <div>
             <label className="block text-slate-400 mb-1.5">
-              Registered Nigerian Business Name
+              Registered Nigerian Business Name (2–120 chars)
             </label>
             <input
               type="text"
@@ -105,7 +137,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
           <div>
             <label className="block text-slate-400 mb-1.5">
-              Support / Escalation WhatsApp Phone
+              Support WhatsApp Phone (Nigerian E.164 +234... or 080...)
             </label>
             <input
               type="text"
@@ -132,8 +164,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <div>
                 <div className="font-semibold text-white">Paystack Adapter</div>
                 <p className="text-slate-400 mt-0.5">
-                  Verifies <span className="font-mono-tabular">x-paystack-signature</span>{' '}
-                  via HMAC-SHA512 on raw request body.
+                  Verifies{' '}
+                  <span className="font-mono-tabular">x-paystack-signature</span> via
+                  HMAC-SHA512 on raw request body.
                 </p>
               </div>
             </label>
@@ -162,11 +195,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
             <div>
               <h3 className="text-sm font-semibold text-white">
-                WhatsApp Messaging Provider & Approved Templates
+                WhatsApp Messaging Provider & Approved Templates (Zod Validated)
               </h3>
               <p className="text-slate-400 mt-0.5">
-                Switch seamlessly between Meta WhatsApp Cloud API and Termii behind the{' '}
-                <span className="font-mono-tabular">WhatsAppProvider</span> interface.
+                Template names must match{' '}
+                <span className="font-mono-tabular">^[a-z0-9_]&#123;3,64&#125;$</span>.
               </p>
             </div>
             <div className="flex items-center gap-1 bg-slate-950 p-1 border border-slate-800">
@@ -235,7 +268,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
           <div className="max-w-xs pt-2">
             <label className="block text-slate-400 mb-1.5">
-              Payment Retry Token Expiration (Hours)
+              Payment Retry Token Expiration (1–720 Hours)
             </label>
             <input
               type="number"
@@ -246,12 +279,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         </div>
 
+        {validationError && (
+          <div className="border border-red-900/60 bg-red-950/40 p-3.5 flex items-center gap-2 text-xs text-red-300">
+            <AlertTriangle className="h-4 w-4 text-red-400 shrink-0" />
+            <span>Zod Validation Error: {validationError}</span>
+          </div>
+        )}
+
         <div className="flex items-center justify-between border-t border-slate-800 pt-5">
           <div>
             {savedNotice && (
               <span className="inline-flex items-center gap-1.5 text-xs text-emerald-400">
                 <CheckCircle2 className="h-4 w-4" />
-                Configuration persisted to PostgreSQL
+                Validated configuration persisted to PostgreSQL
               </span>
             )}
           </div>
@@ -261,7 +301,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             className="inline-flex items-center gap-2 px-5 py-2.5 text-xs font-semibold bg-emerald-600 text-white hover:bg-emerald-500 disabled:opacity-50 transition-colors whitespace-nowrap"
           >
             <Save className="h-3.5 w-3.5" />
-            {saving ? 'Saving Configuration...' : 'Save Workspace Settings'}
+            {saving ? 'Validating & Saving...' : 'Save Workspace Settings'}
           </button>
         </div>
       </div>

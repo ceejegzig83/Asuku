@@ -1,5 +1,13 @@
 import React, { useState } from 'react';
-import { Send, CheckCircle2, XCircle, Clock, Code2 } from 'lucide-react';
+import {
+  Send,
+  CheckCircle2,
+  XCircle,
+  Clock,
+  Code2,
+  AlertTriangle,
+  ShieldAlert,
+} from 'lucide-react';
 import { Customer, WhatsAppLogItem } from '../types.ts';
 
 interface WhatsAppSequenceViewProps {
@@ -43,10 +51,14 @@ export const WhatsAppSequenceView: React.FC<WhatsAppSequenceViewProps> = ({
         body: JSON.stringify({ whatsappLogId: logId }),
       });
       const data = await res.json();
-      setWorkerNotice(data.message || data.reason || 'Worker check completed');
+      setWorkerNotice(
+        data.message || data.reason || data.error || 'Worker check completed'
+      );
       await onRefresh();
     } catch (err: unknown) {
-      setWorkerNotice(err instanceof Error ? err.message : 'Worker execution failed');
+      setWorkerNotice(
+        err instanceof Error ? err.message : 'Worker execution failed'
+      );
     } finally {
       setDispatchingId(null);
     }
@@ -54,15 +66,31 @@ export const WhatsAppSequenceView: React.FC<WhatsAppSequenceViewProps> = ({
 
   const handleToggleCustomerOptIn = async (customer: Customer) => {
     setTogglingCustId(customer.id);
+    setWorkerNotice(null);
     try {
-      await fetch(`/api/customers/${customer.id}/opt-in`, {
+      const nextOptIn = !customer.whatsappOptIn;
+      const res = await fetch(`/api/customers/${customer.id}/opt-in`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
           ...authHeaders,
         },
-        body: JSON.stringify({ whatsappOptIn: !customer.whatsappOptIn }),
+        body: JSON.stringify({ whatsappOptIn: nextOptIn }),
       });
+      const data = await res.json();
+      if (res.ok) {
+        if (!nextOptIn && data.cancelledQueuedCount > 0) {
+          setWorkerNotice(
+            `Opt-in revoked for ${customer.name}. Automatically cancelled ${data.cancelledQueuedCount} queued WhatsApp reminder(s).`
+          );
+        } else {
+          setWorkerNotice(
+            `Updated WhatsApp opt-in consent for ${customer.name} to ${
+              nextOptIn ? 'OPTED IN' : 'OPTED OUT'
+            }.`
+          );
+        }
+      }
       await onRefresh();
     } finally {
       setTogglingCustId(null);
@@ -73,6 +101,49 @@ export const WhatsAppSequenceView: React.FC<WhatsAppSequenceViewProps> = ({
     if (step === 1) return 'Step 1 · T+0 Immediate';
     if (step === 2) return 'Step 2 · T+24h Reminder';
     return 'Step 3 · T+72h Final Notice';
+  };
+
+  const renderStatusState = (log: WhatsAppLogItem) => {
+    switch (log.status) {
+      case 'READ':
+      case 'DELIVERED':
+      case 'SENT':
+        return (
+          <span className="inline-flex items-center gap-1.5 text-emerald-400">
+            <CheckCircle2 className="h-3.5 w-3.5" />
+            {log.status}
+          </span>
+        );
+      case 'QUEUED':
+        return (
+          <span className="inline-flex items-center gap-1.5 text-amber-400">
+            <Clock className="h-3.5 w-3.5" />
+            QUEUED
+          </span>
+        );
+      case 'NOT_CONFIGURED':
+        return (
+          <span className="inline-flex items-center gap-1.5 text-amber-300">
+            <AlertTriangle className="h-3.5 w-3.5" />
+            NOT_CONFIGURED
+          </span>
+        );
+      case 'FAILED':
+        return (
+          <span className="inline-flex items-center gap-1.5 text-red-400">
+            <ShieldAlert className="h-3.5 w-3.5" />
+            FAILED
+          </span>
+        );
+      case 'CANCELLED':
+      default:
+        return (
+          <span className="inline-flex items-center gap-1.5 text-slate-400">
+            <XCircle className="h-3.5 w-3.5" />
+            {log.status}
+          </span>
+        );
+    }
   };
 
   return (
@@ -89,15 +160,12 @@ export const WhatsAppSequenceView: React.FC<WhatsAppSequenceViewProps> = ({
               <span className="font-mono-tabular text-slate-200">
                 UNIQUE(failed_payment_id, sequence_step)
               </span>
-              . Before every scheduled message, the worker verifies{' '}
-              <span className="font-mono-tabular text-slate-200">
-                payment.status === &apos;PENDING&apos;
-              </span>{' '}
-              and{' '}
-              <span className="font-mono-tabular text-slate-200">
-                customer.whatsapp_opt_in === true
+              . Never simulates delivery when provider credentials are missing (
+              <span className="font-mono-tabular text-amber-300">
+                NOT_CONFIGURED
               </span>
-              .
+              ) or when an API request errors (
+              <span className="font-mono-tabular text-red-400">FAILED</span>).
             </p>
           </div>
 
@@ -126,10 +194,13 @@ export const WhatsAppSequenceView: React.FC<WhatsAppSequenceViewProps> = ({
               className="border border-slate-800 bg-slate-950 px-3 py-1.5 text-xs text-slate-200"
             >
               <option value="ALL">All Statuses</option>
-              <option value="QUEUED">Queued (Scheduled)</option>
-              <option value="DELIVERED">Delivered</option>
-              <option value="READ">Read</option>
-              <option value="CANCELLED">Auto-Cancelled</option>
+              <option value="QUEUED">QUEUED</option>
+              <option value="SENT">SENT</option>
+              <option value="DELIVERED">DELIVERED</option>
+              <option value="READ">READ</option>
+              <option value="NOT_CONFIGURED">NOT_CONFIGURED</option>
+              <option value="FAILED">FAILED</option>
+              <option value="CANCELLED">CANCELLED</option>
             </select>
           </div>
         </div>
@@ -187,24 +258,10 @@ export const WhatsAppSequenceView: React.FC<WhatsAppSequenceViewProps> = ({
                     {log.provider}
                   </td>
                   <td className="py-3 px-4">
-                    {log.status === 'READ' || log.status === 'DELIVERED' ? (
-                      <span className="inline-flex items-center gap-1.5 text-emerald-400">
-                        <CheckCircle2 className="h-3.5 w-3.5" />
-                        {log.status}
-                      </span>
-                    ) : log.status === 'QUEUED' ? (
-                      <span className="inline-flex items-center gap-1.5 text-amber-400">
-                        <Clock className="h-3.5 w-3.5" />
-                        QUEUED
-                      </span>
-                    ) : (
-                      <span className="inline-flex items-center gap-1.5 text-slate-400">
-                        <XCircle className="h-3.5 w-3.5" />
-                        {log.status}
-                      </span>
-                    )}
+                    {renderStatusState(log)}
                     {log.errorMessage && (
                       <div className="text-[11px] text-slate-400 mt-0.5 max-w-xs truncate">
+                        {log.errorCode ? `[${log.errorCode}] ` : ''}
                         {log.errorMessage}
                       </div>
                     )}
@@ -235,7 +292,7 @@ export const WhatsAppSequenceView: React.FC<WhatsAppSequenceViewProps> = ({
                       <span className="font-mono-tabular text-slate-500">
                         {log.providerMessageId
                           ? log.providerMessageId.slice(0, 14) + '...'
-                          : '—'}
+                          : 'No Fake ID'}
                       </span>
                     )}
                   </td>
@@ -264,11 +321,22 @@ export const WhatsAppSequenceView: React.FC<WhatsAppSequenceViewProps> = ({
                   </span>
                 </p>
                 <p className="font-mono-tabular">
-                  Adapter: {selectedLog.provider} · Step {selectedLog.sequenceStep}
+                  Adapter: {selectedLog.provider} · Step {selectedLog.sequenceStep} ·{' '}
+                  {selectedLog.status}
                 </p>
-                {selectedLog.providerMessageId && (
+                {selectedLog.providerMessageId ? (
                   <p className="font-mono-tabular text-emerald-400 break-all">
-                    Message ID: {selectedLog.providerMessageId}
+                    Provider Message ID: {selectedLog.providerMessageId}
+                  </p>
+                ) : (
+                  <p className="font-mono-tabular text-amber-300">
+                    Provider Message ID: None (Never faked on {selectedLog.status})
+                  </p>
+                )}
+                {selectedLog.errorMessage && (
+                  <p className="text-red-300 leading-relaxed">
+                    Diagnostic: {selectedLog.errorCode ? `[${selectedLog.errorCode}] ` : ''}
+                    {selectedLog.errorMessage}
                   </p>
                 )}
               </div>
@@ -294,7 +362,9 @@ export const WhatsAppSequenceView: React.FC<WhatsAppSequenceViewProps> = ({
               Customer WhatsApp Opt-In Governance (customers.whatsapp_opt_in)
             </h3>
             <p className="text-xs text-slate-400 mt-0.5">
-              Recovery Worker verifies <span className="font-mono-tabular">whatsapp_opt_in</span> before sending any template message.
+              Revoking opt-in immediately cancels all{' '}
+              <span className="font-mono-tabular text-slate-200">QUEUED</span> WhatsApp
+              reminders for that customer and blocks future sequence dispatches.
             </p>
           </div>
         </div>
@@ -307,6 +377,7 @@ export const WhatsAppSequenceView: React.FC<WhatsAppSequenceViewProps> = ({
                 <th className="py-3 px-4 font-medium">Email</th>
                 <th className="py-3 px-4 font-medium">E.164 Phone Number</th>
                 <th className="py-3 px-4 font-medium">WhatsApp Opt-In Status</th>
+                <th className="py-3 px-4 font-medium text-right">Consent Updated</th>
                 <th className="py-3 px-6 font-medium text-right">Action</th>
               </tr>
             </thead>
@@ -324,6 +395,16 @@ export const WhatsAppSequenceView: React.FC<WhatsAppSequenceViewProps> = ({
                     ) : (
                       <span className="text-amber-400">Opted Out · Blocked</span>
                     )}
+                  </td>
+                  <td className="py-3 px-4 text-right font-mono-tabular text-slate-400">
+                    {c.whatsappOptInUpdatedAt
+                      ? new Date(c.whatsappOptInUpdatedAt).toLocaleString('en-NG', {
+                          month: 'short',
+                          day: 'numeric',
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })
+                      : '—'}
                   </td>
                   <td className="py-3 px-6 text-right">
                     <button

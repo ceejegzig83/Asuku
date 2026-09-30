@@ -7,17 +7,22 @@ import {
   Repeat,
   FileJson,
   ArrowRight,
+  CheckCheck,
 } from 'lucide-react';
-import { WebhookEventItem } from '../types.ts';
+import { FailedPaymentItem, WebhookEventItem } from '../types.ts';
 
 interface WebhookSimulatorViewProps {
   webhookEvents: WebhookEventItem[];
+  failedPayments: FailedPaymentItem[];
+  webhookToken: string | null;
   authHeaders: Record<string, string>;
   onRefresh: () => Promise<void>;
 }
 
 export const WebhookSimulatorView: React.FC<WebhookSimulatorViewProps> = ({
   webhookEvents,
+  failedPayments,
+  webhookToken,
   authHeaders,
   onRefresh,
 }) => {
@@ -33,6 +38,7 @@ export const WebhookSimulatorView: React.FC<WebhookSimulatorViewProps> = ({
   );
   const [customerEmail, setCustomerEmail] = useState('f.adeyemi@lagoonretail.ng');
   const [customerPhone, setCustomerPhone] = useState('08037719284');
+  const [customerWhatsappOptIn, setCustomerWhatsappOptIn] = useState(true);
   const [planName, setPlanName] = useState('Enterprise POS & Settlement Suite');
   const [amountNaira, setAmountNaira] = useState(1450000);
   const [providerReference, setProviderReference] = useState(
@@ -52,13 +58,19 @@ export const WebhookSimulatorView: React.FC<WebhookSimulatorViewProps> = ({
     webhookEvents[0] || null
   );
 
+  const pendingPayments = failedPayments.filter((fp) => fp.status === 'PENDING');
+
   const dispatchSimulation = async (overrideParams?: {
     keepSameEventId?: boolean;
     forceTamper?: boolean;
     forceEventType?: 'invoice.payment_failed' | 'charge.failed' | 'charge.success';
+    customReference?: string;
+    customAmount?: number;
+    customProvider?: 'PAYSTACK' | 'FLUTTERWAVE';
   }) => {
     setRunning(true);
     try {
+      const targetProvider = overrideParams?.customProvider || provider;
       const targetEventId = overrideParams?.keepSameEventId
         ? providerEventId
         : providerEventId;
@@ -67,6 +79,14 @@ export const WebhookSimulatorView: React.FC<WebhookSimulatorViewProps> = ({
           ? overrideParams.forceTamper
           : tamperSignature;
       const targetEvent = overrideParams?.forceEventType || eventType;
+      const targetReference =
+        overrideParams?.customReference !== undefined
+          ? overrideParams.customReference
+          : providerReference;
+      const targetAmount =
+        overrideParams?.customAmount !== undefined
+          ? overrideParams.customAmount
+          : Number(amountNaira);
 
       const res = await fetch('/api/webhooks/simulate', {
         method: 'POST',
@@ -75,16 +95,18 @@ export const WebhookSimulatorView: React.FC<WebhookSimulatorViewProps> = ({
           ...authHeaders,
         },
         body: JSON.stringify({
-          provider,
+          provider: targetProvider,
           eventType: targetEvent,
           providerEventId: targetEventId,
           tamperSignature: targetTamper,
           customerName,
           customerEmail,
           customerPhone,
+          customerWhatsappOptIn,
           planName,
-          amountNaira: Number(amountNaira),
-          providerReference,
+          amountNaira: targetAmount,
+          currency: 'NGN',
+          providerReference: targetReference,
           failureReason,
         }),
       });
@@ -115,6 +137,19 @@ export const WebhookSimulatorView: React.FC<WebhookSimulatorViewProps> = ({
     setProviderReference(nextRef);
   };
 
+  const loadPendingForExactSuccessMatch = (fp: FailedPaymentItem) => {
+    setProvider(fp.provider);
+    setEventType('charge.success');
+    setProviderEventId(
+      `evt_${fp.provider.toLowerCase()}_rec_${Math.floor(10000 + Math.random() * 90000)}`
+    );
+    setProviderReference(fp.providerReference || '');
+    setAmountNaira(fp.amountNumber);
+    setCustomerName(fp.customerName);
+    setCustomerPhone(fp.customerPhone);
+    setPlanName(fp.planName);
+  };
+
   return (
     <div className="space-y-8">
       {/* Architectural Pipeline Banner */}
@@ -122,22 +157,19 @@ export const WebhookSimulatorView: React.FC<WebhookSimulatorViewProps> = ({
         <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
           <div>
             <h2 className="text-lg font-semibold text-white">
-              01. Cryptographic Webhook Verification & Idempotency Lab
+              01. Cryptographic Webhook Verification, Exact Matching & Idempotency Lab
             </h2>
             <p className="mt-1 text-xs text-slate-400 max-w-3xl">
-              Test the end-to-end ingestion algorithm: raw-body HMAC verification (
-              <span className="font-mono-tabular text-slate-200">
-                x-paystack-signature
-              </span>{' '}
-              SHA-512 &{' '}
-              <span className="font-mono-tabular text-slate-200">
-                flutterwave-signature
-              </span>{' '}
-              SHA-256), unique constraint idempotency on{' '}
+              Tests raw-body HMAC verification, tenant-bound webhook tokens, unique
+              constraint idempotency on{' '}
               <span className="font-mono-tabular text-slate-200">
                 (provider, provider_event_id)
               </span>
-              , and automatic WhatsApp queue cancellation upon recovery.
+              , SHA-256 recovery token hashing, WhatsApp opt-in governance, and exact{' '}
+              <span className="font-mono-tabular text-slate-200">
+                (provider, reference, amount, currency)
+              </span>{' '}
+              matching on recovery.
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2 text-xs text-slate-300 font-mono-tabular">
@@ -145,11 +177,36 @@ export const WebhookSimulatorView: React.FC<WebhookSimulatorViewProps> = ({
             <ArrowRight className="h-3.5 w-3.5 text-slate-500" />
             <span>Verify HMAC</span>
             <ArrowRight className="h-3.5 w-3.5 text-slate-500" />
-            <span>Idempotent Insert</span>
+            <span>Exact Match</span>
             <ArrowRight className="h-3.5 w-3.5 text-slate-500" />
-            <span>Queue T+0 / 24h / 72h</span>
+            <span>SHA-256 Token</span>
           </div>
         </div>
+
+        {/* Quick Exact Match Recovery Presets for Pending Payments */}
+        {pendingPayments.length > 0 && (
+          <div className="mt-4 border-t border-slate-800 pt-4">
+            <div className="text-xs text-slate-400 mb-2">
+              Load Pending Failed Payment for Exact-Match{' '}
+              <span className="font-mono-tabular text-slate-200">charge.success</span>{' '}
+              Recovery Test:
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {pendingPayments.map((fp) => (
+                <button
+                  key={fp.id}
+                  type="button"
+                  onClick={() => loadPendingForExactSuccessMatch(fp)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs border border-slate-700 bg-slate-950 text-slate-200 hover:border-emerald-500 transition-colors font-mono-tabular"
+                >
+                  <CheckCheck className="h-3.5 w-3.5 text-emerald-400" />
+                  {fp.provider} · {fp.providerReference} · ₦
+                  {fp.amountNumber.toLocaleString('en-NG')}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Simulator Controls + Live Response */}
@@ -231,7 +288,7 @@ export const WebhookSimulatorView: React.FC<WebhookSimulatorViewProps> = ({
                   charge.failed (Trigger Recovery)
                 </option>
                 <option value="charge.success">
-                  charge.success (Verify & Cancel Queue)
+                  charge.success (Exact Match Verify & Cancel Queue)
                 </option>
               </select>
             </div>
@@ -250,7 +307,7 @@ export const WebhookSimulatorView: React.FC<WebhookSimulatorViewProps> = ({
 
             <div>
               <label className="block text-slate-400 mb-1.5">
-                Transaction Reference
+                Transaction Reference (Exact Match Key)
               </label>
               <input
                 type="text"
@@ -272,7 +329,7 @@ export const WebhookSimulatorView: React.FC<WebhookSimulatorViewProps> = ({
 
             <div>
               <label className="block text-slate-400 mb-1.5">
-                Nigerian WhatsApp Phone (Auto-Normalized to +234)
+                Nigerian WhatsApp Phone (+234 / 080...)
               </label>
               <input
                 type="text"
@@ -317,8 +374,24 @@ export const WebhookSimulatorView: React.FC<WebhookSimulatorViewProps> = ({
             </div>
           </div>
 
-          {/* Security toggle */}
-          <div className="flex items-center justify-between border-t border-slate-800 pt-4">
+          {/* Security & Opt-In Governance Toggles */}
+          <div className="border-t border-slate-800 pt-4 space-y-3">
+            <label className="flex items-center gap-2.5 text-xs text-slate-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={customerWhatsappOptIn}
+                onChange={(e) => setCustomerWhatsappOptIn(e.target.checked)}
+                className="h-4 w-4 accent-emerald-500"
+              />
+              <span>
+                Customer granted WhatsApp Opt-In consent (
+                <span className="font-mono-tabular text-emerald-400">
+                  whatsapp_opt_in = {String(customerWhatsappOptIn)}
+                </span>
+                ) — uncheck to test Opt-In Governance blocking
+              </span>
+            </label>
+
             <label className="flex items-center gap-2.5 text-xs text-slate-300 cursor-pointer">
               <input
                 type="checkbox"
@@ -418,16 +491,22 @@ export const WebhookSimulatorView: React.FC<WebhookSimulatorViewProps> = ({
                 <FileJson className="h-6 w-6 text-slate-500 mx-auto" />
                 <p className="text-xs text-slate-400">
                   Click &ldquo;1. Send Signed Webhook&rdquo; to execute HMAC signature
-                  verification, idempotent persistence, and BullMQ recovery scheduling.
+                  verification, SHA-256 token hashing, and BullMQ recovery scheduling.
                 </p>
               </div>
             )}
           </div>
 
           <div className="border-t border-slate-800 pt-4 text-xs text-slate-400 space-y-1">
-            <p className="text-slate-300 font-medium">Production Endpoints Active:</p>
-            <p className="font-mono-tabular">POST /api/v1/webhooks/paystack</p>
-            <p className="font-mono-tabular">POST /api/v1/webhooks/flutterwave</p>
+            <p className="text-slate-300 font-medium">
+              Tenant-Isolated Webhook Endpoints (Objective 6):
+            </p>
+            <p className="font-mono-tabular break-all">
+              POST /api/v1/webhooks/paystack/{webhookToken || ':webhookToken'}
+            </p>
+            <p className="font-mono-tabular break-all">
+              POST /api/v1/webhooks/flutterwave/{webhookToken || ':webhookToken'}
+            </p>
           </div>
         </div>
       </div>

@@ -10,6 +10,13 @@ import {
   webhookEvents,
   whatsappLogs,
 } from './schema.ts';
+import {
+  hashRecoveryToken,
+  isConfiguredSecret,
+  isMockProvidersEnabled,
+  normalizeNigerianPhone,
+} from '../server/providers.ts';
+import { isDemoModeAllowed } from '../middleware/auth.ts';
 
 export async function getOrCreateTenantContext(
   uid: string,
@@ -53,6 +60,7 @@ export async function getOrCreateTenantContext(
       if (byEmail[0]) {
         business = byEmail[0];
       } else {
+        const webhookToken = `whsec_${crypto.randomBytes(18).toString('hex')}`;
         const inserted = await db
           .insert(businesses)
           .values({
@@ -65,6 +73,7 @@ export async function getOrCreateTenantContext(
             phone: '+2348094421900',
             currency: 'NGN',
             timezone: 'Africa/Lagos',
+            webhookToken,
             paystackEnabled: true,
             flutterwaveEnabled: true,
             whatsappProvider: 'META',
@@ -78,11 +87,278 @@ export async function getOrCreateTenantContext(
       }
     }
 
+    // Ensure existing tenant has a cryptographic webhookToken
+    if (!business.webhookToken) {
+      const generatedWebhookToken = `whsec_${crypto.randomBytes(18).toString('hex')}`;
+      const [updatedBiz] = await db
+        .update(businesses)
+        .set({ webhookToken: generatedWebhookToken, updatedAt: new Date() })
+        .where(eq(businesses.id, business.id))
+        .returning();
+      if (updatedBiz) {
+        business = updatedBiz;
+      }
+    }
+
     await seedBusinessIfEmpty(business.id);
+    if (process.env.NODE_ENV !== 'production') {
+      await ensureDevTestFailedPayment(business.id);
+    }
     return business;
   } catch (error) {
     console.error('Database query failed in getOrCreateTenantContext:', error);
     throw new Error('Failed to initialize tenant workspace.', { cause: error });
+  }
+}
+
+/**
+ * Development-only helper: Ensures the isolated development test failed-payment records
+ * (ASUKU-TEST-FAILED-001 and ASUKU-TEST-FAILED-002) exist for the authenticated development tenant.
+ * - Does NOT contact Paystack or Flutterwave
+ * - Does NOT charge any card
+ * - Does NOT send or queue any WhatsApp messages
+ * - Never modifies existing test or production records
+ * - Stores ONLY the SHA-256 recovery_token_hash (plaintext recovery_token is NULL)
+ */
+export async function ensureDevTestFailedPayment(businessId: string) {
+  try {
+    const existingTestPayment = await db
+      .select()
+      .from(failedPayments)
+      .where(
+        and(
+          eq(failedPayments.businessId, businessId),
+          eq(failedPayments.providerReference, 'ASUKU-TEST-FAILED-001')
+        )
+      );
+
+    let firstTestPayment = existingTestPayment[0];
+
+    if (!firstTestPayment) {
+      // 1. Find or create the dedicated test customer for this tenant
+      const existingTestCustomer = await db
+        .select()
+        .from(customers)
+        .where(
+          and(
+            eq(customers.businessId, businessId),
+            eq(customers.externalCustomerId, 'CUS_ASUKU_DEV_TEST_001')
+          )
+        );
+
+      let testCustomer = existingTestCustomer[0];
+      if (!testCustomer) {
+        const [createdCustomer] = await db
+          .insert(customers)
+          .values({
+            businessId,
+            externalCustomerId: 'CUS_ASUKU_DEV_TEST_001',
+            name: 'ASUKU TEST CUSTOMER',
+            email: 'dev-test-only@asuku.test',
+            phone: '+2348000000001',
+            whatsappOptIn: true,
+            whatsappOptInUpdatedAt: new Date(),
+          })
+          .returning();
+        testCustomer = createdCustomer;
+      }
+
+      // 2. Find or create the associated test subscription for this tenant
+      const testSubProviderId = `SUB_ASUKU_DEV_TEST_${businessId.slice(0, 8)}`;
+      const existingTestSub = await db
+        .select()
+        .from(subscriptions)
+        .where(
+          and(
+            eq(subscriptions.businessId, businessId),
+            eq(subscriptions.providerSubscriptionId, testSubProviderId)
+          )
+        );
+
+      let testSubscription = existingTestSub[0];
+      const now = new Date();
+      if (!testSubscription) {
+        const [createdSub] = await db
+          .insert(subscriptions)
+          .values({
+            businessId,
+            customerId: testCustomer.id,
+            provider: 'PAYSTACK',
+            providerSubscriptionId: testSubProviderId,
+            planName: 'DEV TEST PLAN — Recovery Verification Sandbox',
+            amount: '250000.00',
+            currency: 'NGN',
+            status: 'PAST_DUE',
+            currentPeriodStart: new Date(now.getTime() - 30 * 86400000),
+            currentPeriodEnd: now,
+          })
+          .returning();
+        testSubscription = createdSub;
+      }
+
+      // 3. Generate cryptographic recovery token using existing secure logic and store ONLY SHA-256 hash
+      const rawRecoveryToken = `asuku_${crypto.randomBytes(32).toString('base64url')}`;
+      const recoveryTokenHash = hashRecoveryToken(rawRecoveryToken);
+      const expiresAt = new Date(now.getTime() + 168 * 3600 * 1000);
+
+      const [createdFailedPayment] = await db
+        .insert(failedPayments)
+        .values({
+          businessId,
+          customerId: testCustomer.id,
+          subscriptionId: testSubscription.id,
+          provider: 'PAYSTACK',
+          providerTransactionId: 'TXN-ASUKU-DEV-TEST-001',
+          providerReference: 'ASUKU-TEST-FAILED-001',
+          amount: '250000.00',
+          currency: 'NGN',
+          failureReason:
+            '[DEVELOPMENT TEST RECORD — NO LIVE CARD CHARGED] Simulated failed recurring charge for recovery testing',
+          status: 'PENDING',
+          recoveryStatus: 'ACTIVE',
+          recoveryToken: null, // Plaintext token is never stored
+          recoveryTokenHash,
+          failedAt: now,
+          expiresAt,
+        })
+        .returning();
+
+      firstTestPayment = createdFailedPayment;
+    }
+
+    await ensureSecondDevTestFailedPayment(businessId, firstTestPayment?.failedAt);
+
+    return firstTestPayment;
+  } catch (error) {
+    console.error('Error in ensureDevTestFailedPayment:', error);
+    return null;
+  }
+}
+
+/**
+ * Development-only helper: Creates the second isolated test failed-payment record
+ * (ASUKU-TEST-FAILED-002 / ASUKU TEST CUSTOMER B) for exact-payment-matching testing.
+ * - Does NOT contact Paystack or Flutterwave
+ * - Does NOT charge any card
+ * - Does NOT queue or send any WhatsApp messages
+ * - Does NOT modify ASUKU-TEST-FAILED-001 or any other record
+ * - Stores ONLY the SHA-256 recovery_token_hash (plaintext recovery_token is NULL)
+ */
+export async function ensureSecondDevTestFailedPayment(
+  businessId: string,
+  firstRecordFailedAt?: Date | null
+) {
+  try {
+    const existingSecondPayment = await db
+      .select()
+      .from(failedPayments)
+      .where(
+        and(
+          eq(failedPayments.businessId, businessId),
+          eq(failedPayments.providerReference, 'ASUKU-TEST-FAILED-002')
+        )
+      );
+
+    if (existingSecondPayment.length > 0) {
+      return existingSecondPayment[0];
+    }
+
+    // 1. Find or create the dedicated second test customer (ASUKU TEST CUSTOMER B)
+    const existingCustomerB = await db
+      .select()
+      .from(customers)
+      .where(
+        and(
+          eq(customers.businessId, businessId),
+          eq(customers.externalCustomerId, 'CUS_ASUKU_DEV_TEST_002')
+        )
+      );
+
+    let customerB = existingCustomerB[0];
+    if (!customerB) {
+      const [createdCustomerB] = await db
+        .insert(customers)
+        .values({
+          businessId,
+          externalCustomerId: 'CUS_ASUKU_DEV_TEST_002',
+          name: 'ASUKU TEST CUSTOMER B',
+          email: 'dev-test-b-only@asuku.test',
+          phone: '+2348000000002',
+          whatsappOptIn: true,
+          whatsappOptInUpdatedAt: new Date(),
+        })
+        .returning();
+      customerB = createdCustomerB;
+    }
+
+    // 2. Find or create the associated test subscription for ASUKU TEST CUSTOMER B
+    const testSubBProviderId = `SUB_ASUKU_DEV_TEST_B_${businessId.slice(0, 8)}`;
+    const existingTestSubB = await db
+      .select()
+      .from(subscriptions)
+      .where(
+        and(
+          eq(subscriptions.businessId, businessId),
+          eq(subscriptions.providerSubscriptionId, testSubBProviderId)
+        )
+      );
+
+    let testSubscriptionB = existingTestSubB[0];
+    const now = new Date();
+    if (!testSubscriptionB) {
+      const [createdSubB] = await db
+        .insert(subscriptions)
+        .values({
+          businessId,
+          customerId: customerB.id,
+          provider: 'PAYSTACK',
+          providerSubscriptionId: testSubBProviderId,
+          planName: 'DEV TEST PLAN B — Exact Payment Matching Sandbox',
+          amount: '150000.00',
+          currency: 'NGN',
+          status: 'PAST_DUE',
+          currentPeriodStart: new Date(now.getTime() - 30 * 86400000),
+          currentPeriodEnd: now,
+        })
+        .returning();
+      testSubscriptionB = createdSubB;
+    }
+
+    // 3. Generate cryptographic recovery token using existing secure logic and store ONLY SHA-256 hash
+    const rawRecoveryToken = `asuku_${crypto.randomBytes(32).toString('base64url')}`;
+    const recoveryTokenHash = hashRecoveryToken(rawRecoveryToken);
+    // Order slightly after #001 in descending failedAt order so #001 appears first and #002 appears second
+    const failedAt = firstRecordFailedAt
+      ? new Date(new Date(firstRecordFailedAt).getTime() - 60 * 1000)
+      : now;
+    const expiresAt = new Date(now.getTime() + 168 * 3600 * 1000);
+
+    const [createdSecondFailedPayment] = await db
+      .insert(failedPayments)
+      .values({
+        businessId,
+        customerId: customerB.id,
+        subscriptionId: testSubscriptionB.id,
+        provider: 'PAYSTACK',
+        providerTransactionId: 'TXN-ASUKU-DEV-TEST-002',
+        providerReference: 'ASUKU-TEST-FAILED-002',
+        amount: '150000.00',
+        currency: 'NGN',
+        failureReason:
+          '[DEVELOPMENT TEST RECORD — NO LIVE CARD CHARGED] Simulated failed recurring charge for exact-payment-matching testing.',
+        status: 'PENDING',
+        recoveryStatus: 'ACTIVE',
+        recoveryToken: null, // Plaintext token is never stored
+        recoveryTokenHash,
+        failedAt,
+        expiresAt,
+      })
+      .returning();
+
+    return createdSecondFailedPayment;
+  } catch (error) {
+    console.error('Error in ensureSecondDevTestFailedPayment:', error);
+    return null;
   }
 }
 
@@ -111,6 +387,7 @@ export async function seedBusinessIfEmpty(businessId: string) {
           email: 'c.nwosu@lekkifleet.ng',
           phone: '+2348034192810',
           whatsappOptIn: true,
+          whatsappOptInUpdatedAt: hoursAgo(120),
         },
         {
           businessId,
@@ -119,6 +396,7 @@ export async function seedBusinessIfEmpty(businessId: string) {
           email: 'abello@medcorediagnostics.com.ng',
           phone: '+2348091123409',
           whatsappOptIn: true,
+          whatsappOptInUpdatedAt: hoursAgo(200),
         },
         {
           businessId,
@@ -127,6 +405,7 @@ export async function seedBusinessIfEmpty(businessId: string) {
           email: 'tunde@yabacloud.io',
           phone: '+2348128837104',
           whatsappOptIn: true,
+          whatsappOptInUpdatedAt: hoursAgo(90),
         },
         {
           businessId,
@@ -135,6 +414,7 @@ export async function seedBusinessIfEmpty(businessId: string) {
           email: 'ngozi.eze@riverspetro.ng',
           phone: '+2347065541920',
           whatsappOptIn: true,
+          whatsappOptInUpdatedAt: hoursAgo(300),
         },
         {
           businessId,
@@ -143,6 +423,7 @@ export async function seedBusinessIfEmpty(businessId: string) {
           email: 'seun@ibadanretail.ng',
           phone: '+2348023310982',
           whatsappOptIn: true,
+          whatsappOptInUpdatedAt: hoursAgo(48),
         },
         {
           businessId,
@@ -151,6 +432,7 @@ export async function seedBusinessIfEmpty(businessId: string) {
           email: 'imusa@kanoagro.com.ng',
           phone: '+2348057723190',
           whatsappOptIn: false,
+          whatsappOptInUpdatedAt: hoursAgo(180),
         },
       ])
       .returning();
@@ -237,18 +519,11 @@ export async function seedBusinessIfEmpty(businessId: string) {
 
     const [s1, s2, s3, s4, s5, s6] = seedSubRows;
 
-    const makeToken = (slug: string) => {
-      const token = `asuku_${slug}_${crypto.randomBytes(8).toString('base64url')}`;
-      const hash = crypto.createHash('sha256').update(token).digest('hex');
-      return { token, hash };
+    // PHASE 1 OBJECTIVE 5: Store ONLY SHA-256 hash of recovery tokens in PostgreSQL (recoveryToken = null)
+    const makeTokenHashOnly = () => {
+      const raw = crypto.randomBytes(32).toString('base64url');
+      return hashRecoveryToken(raw);
     };
-
-    const t1 = makeToken('lekki');
-    const t2 = makeToken('medcore');
-    const t3 = makeToken('yaba');
-    const t4 = makeToken('petro');
-    const t5 = makeToken('ibadan');
-    const t6 = makeToken('kano');
 
     const seedFailedRows = await db
       .insert(failedPayments)
@@ -265,8 +540,8 @@ export async function seedBusinessIfEmpty(businessId: string) {
           failureReason: 'Insufficient Funds on Corporate Zenith Visa Card (*4921)',
           status: 'PENDING',
           recoveryStatus: 'ACTIVE',
-          recoveryToken: t1.token,
-          recoveryTokenHash: t1.hash,
+          recoveryToken: null,
+          recoveryTokenHash: makeTokenHashOnly(),
           failedAt: hoursAgo(5),
           expiresAt: hoursAhead(163),
         },
@@ -282,8 +557,9 @@ export async function seedBusinessIfEmpty(businessId: string) {
           failureReason: 'Issuer Declined: Card Recurring Limit Exceeded (GTBank *8812)',
           status: 'RECOVERED',
           recoveryStatus: 'RECOVERED',
-          recoveryToken: t2.token,
-          recoveryTokenHash: t2.hash,
+          recoveryToken: null,
+          recoveryTokenHash: makeTokenHashOnly(),
+          recoveryTokenUsedAt: hoursAgo(12),
           failedAt: hoursAgo(38),
           recoveredAt: hoursAgo(12),
           expiresAt: hoursAhead(130),
@@ -297,11 +573,11 @@ export async function seedBusinessIfEmpty(businessId: string) {
           providerReference: 'flw_ref_yaba_3109',
           amount: '950000.00',
           currency: 'NGN',
-          failureReason: ' Do Not Honor — Bank 3DS Token Expired (Access Bank *1104)',
+          failureReason: 'Do Not Honor — Bank 3DS Token Expired (Access Bank *1104)',
           status: 'PENDING',
           recoveryStatus: 'ACTIVE',
-          recoveryToken: t3.token,
-          recoveryTokenHash: t3.hash,
+          recoveryToken: null,
+          recoveryTokenHash: makeTokenHashOnly(),
           failedAt: hoursAgo(27),
           expiresAt: hoursAhead(141),
         },
@@ -317,8 +593,9 @@ export async function seedBusinessIfEmpty(businessId: string) {
           failureReason: 'Expired Corporate Mastercard (*5539)',
           status: 'RECOVERED',
           recoveryStatus: 'RECOVERED',
-          recoveryToken: t4.token,
-          recoveryTokenHash: t4.hash,
+          recoveryToken: null,
+          recoveryTokenHash: makeTokenHashOnly(),
+          recoveryTokenUsedAt: hoursAgo(78),
           failedAt: hoursAgo(82),
           recoveredAt: hoursAgo(78),
           expiresAt: hoursAhead(86),
@@ -335,8 +612,8 @@ export async function seedBusinessIfEmpty(businessId: string) {
           failureReason: 'Issuer Switch Timeout (NIBSS Interbank Delay)',
           status: 'PENDING',
           recoveryStatus: 'ACTIVE',
-          recoveryToken: t5.token,
-          recoveryTokenHash: t5.hash,
+          recoveryToken: null,
+          recoveryTokenHash: makeTokenHashOnly(),
           failedAt: hoursAgo(1),
           expiresAt: hoursAhead(167),
         },
@@ -352,8 +629,8 @@ export async function seedBusinessIfEmpty(businessId: string) {
           failureReason: 'Customer Opted Out of WhatsApp Recovery Channel',
           status: 'EXPIRED',
           recoveryStatus: 'EXPIRED',
-          recoveryToken: t6.token,
-          recoveryTokenHash: t6.hash,
+          recoveryToken: null,
+          recoveryTokenHash: makeTokenHashOnly(),
           failedAt: hoursAgo(180),
           expiresAt: hoursAgo(12),
         },
@@ -362,9 +639,7 @@ export async function seedBusinessIfEmpty(businessId: string) {
 
     const [fp1, fp2, fp3, fp4, fp5] = seedFailedRows;
 
-    // Seed WhatsApp sequence logs (T+0, T+24h, T+72h) demonstrating idempotency & auto-cancellation
     await db.insert(whatsappLogs).values([
-      // fp1: Failed 5h ago -> Step 1 READ, Step 2 QUEUED (+19h), Step 3 QUEUED (+67h)
       {
         businessId,
         customerId: c1.id,
@@ -384,7 +659,7 @@ export async function seedBusinessIfEmpty(businessId: string) {
           step: 'T+0 Immediate',
           customer: c1.name,
           amount: 'NGN 1,850,000.00',
-          retryUrl: `/r/${t1.token}`,
+          tokenSecurity: 'SHA-256 Hashed (Plaintext Never Stored)',
         },
       },
       {
@@ -402,7 +677,7 @@ export async function seedBusinessIfEmpty(businessId: string) {
           step: 'T+24h Follow-Up',
           customer: c1.name,
           amount: 'NGN 1,850,000.00',
-          retryUrl: `/r/${t1.token}`,
+          tokenSecurity: 'SHA-256 Hashed (Plaintext Never Stored)',
         },
       },
       {
@@ -420,11 +695,9 @@ export async function seedBusinessIfEmpty(businessId: string) {
           step: 'T+72h Final Reminder',
           customer: c1.name,
           amount: 'NGN 1,850,000.00',
-          retryUrl: `/r/${t1.token}`,
+          tokenSecurity: 'SHA-256 Hashed (Plaintext Never Stored)',
         },
       },
-
-      // fp2: Recovered after Step 2 -> Step 1 READ, Step 2 READ, Step 3 CANCELLED automatically!
       {
         businessId,
         customerId: c2.id,
@@ -444,7 +717,6 @@ export async function seedBusinessIfEmpty(businessId: string) {
           step: 'T+0 Immediate',
           customer: c2.name,
           amount: 'NGN 1,250,000.00',
-          retryUrl: `/r/${t2.token}`,
         },
       },
       {
@@ -466,7 +738,6 @@ export async function seedBusinessIfEmpty(businessId: string) {
           step: 'T+24h Follow-Up',
           customer: c2.name,
           amount: 'NGN 1,250,000.00',
-          retryUrl: `/r/${t2.token}`,
         },
       },
       {
@@ -485,11 +756,8 @@ export async function seedBusinessIfEmpty(businessId: string) {
           step: 'T+72h Final Reminder',
           customer: c2.name,
           amount: 'NGN 1,250,000.00',
-          retryUrl: `/r/${t2.token}`,
         },
       },
-
-      // fp3: Failed 27h ago -> Step 1 READ, Step 2 DELIVERED, Step 3 QUEUED
       {
         businessId,
         customerId: c3.id,
@@ -509,7 +777,6 @@ export async function seedBusinessIfEmpty(businessId: string) {
           step: 'T+0 Immediate',
           customer: c3.name,
           amount: 'NGN 950,000.00',
-          retryUrl: `/r/${t3.token}`,
         },
       },
       {
@@ -530,7 +797,6 @@ export async function seedBusinessIfEmpty(businessId: string) {
           step: 'T+24h Follow-Up',
           customer: c3.name,
           amount: 'NGN 950,000.00',
-          retryUrl: `/r/${t3.token}`,
         },
       },
       {
@@ -548,11 +814,8 @@ export async function seedBusinessIfEmpty(businessId: string) {
           step: 'T+72h Final Reminder',
           customer: c3.name,
           amount: 'NGN 950,000.00',
-          retryUrl: `/r/${t3.token}`,
         },
       },
-
-      // fp4: Recovered immediately after Step 1 -> Step 1 READ, Step 2 CANCELLED, Step 3 CANCELLED
       {
         businessId,
         customerId: c4.id,
@@ -572,7 +835,6 @@ export async function seedBusinessIfEmpty(businessId: string) {
           step: 'T+0 Immediate',
           customer: c4.name,
           amount: 'NGN 2,400,000.00',
-          retryUrl: `/r/${t4.token}`,
         },
       },
       {
@@ -591,7 +853,6 @@ export async function seedBusinessIfEmpty(businessId: string) {
           step: 'T+24h Follow-Up',
           customer: c4.name,
           amount: 'NGN 2,400,000.00',
-          retryUrl: `/r/${t4.token}`,
         },
       },
       {
@@ -610,11 +871,8 @@ export async function seedBusinessIfEmpty(businessId: string) {
           step: 'T+72h Final Reminder',
           customer: c4.name,
           amount: 'NGN 2,400,000.00',
-          retryUrl: `/r/${t4.token}`,
         },
       },
-
-      // fp5: Failed 1h ago -> Step 1 DELIVERED, Step 2 QUEUED, Step 3 QUEUED
       {
         businessId,
         customerId: c5.id,
@@ -622,18 +880,18 @@ export async function seedBusinessIfEmpty(businessId: string) {
         provider: 'META',
         templateName: 'payment_failed_recovery',
         sequenceStep: 1,
-        status: 'DELIVERED',
-        providerMessageId: 'wamid.HBgNMjM0ODAyMzMxMDk4MlUCABEYEjY2MTBF',
+        status: 'NOT_CONFIGURED',
+        providerMessageId: null,
+        errorCode: 'META_CREDENTIALS_MISSING',
+        errorMessage:
+          'Meta WhatsApp Cloud API credentials (META_WHATSAPP_ACCESS_TOKEN, META_WHATSAPP_PHONE_NUMBER_ID) are not configured.',
         phoneNumber: c5.phone,
         scheduledAt: hoursAgo(1),
-        sentAt: hoursAgo(1),
-        deliveredAt: hoursAgo(1),
         messagePayload: {
           template: 'payment_failed_recovery',
           step: 'T+0 Immediate',
           customer: c5.name,
           amount: 'NGN 480,000.00',
-          retryUrl: `/r/${t5.token}`,
         },
       },
       {
@@ -651,7 +909,6 @@ export async function seedBusinessIfEmpty(businessId: string) {
           step: 'T+24h Follow-Up',
           customer: c5.name,
           amount: 'NGN 480,000.00',
-          retryUrl: `/r/${t5.token}`,
         },
       },
       {
@@ -669,12 +926,10 @@ export async function seedBusinessIfEmpty(businessId: string) {
           step: 'T+72h Final Reminder',
           customer: c5.name,
           amount: 'NGN 480,000.00',
-          retryUrl: `/r/${t5.token}`,
         },
       },
     ]);
 
-    // Seed webhook events log
     await db.insert(webhookEvents).values([
       {
         businessId,
@@ -692,7 +947,8 @@ export async function seedBusinessIfEmpty(businessId: string) {
             amount: 185000000,
             currency: 'NGN',
             customer: { email: 'c.nwosu@lekkifleet.ng', phone: '+2348034192810' },
-            gateway_response: 'Insufficient Funds on Corporate Zenith Visa Card (*4921)',
+            gateway_response:
+              'Insufficient Funds on Corporate Zenith Visa Card (*4921)',
           },
         },
       },
@@ -779,7 +1035,6 @@ export async function getFullDashboardSnapshot(businessId: string) {
       .where(eq(webhookEvents.businessId, businessId))
       .orderBy(desc(webhookEvents.createdAt));
 
-    // Map customers and subscriptions by ID for rich joined view
     const customerMap = new Map(customerList.map((c) => [c.id, c]));
     const subscriptionMap = new Map(subscriptionList.map((s) => [s.id, s]));
     const failedPaymentMap = new Map(failedPaymentList.map((fp) => [fp.id, fp]));
@@ -827,6 +1082,8 @@ export async function getFullDashboardSnapshot(businessId: string) {
         .sort((a, b) => a.sequenceStep - b.sequenceStep);
       return {
         ...fp,
+        // Never return plaintext recovery tokens from DB
+        recoveryToken: null,
         amountNumber: parseFloat(fp.amount || '0'),
         customerName: customer?.name || 'Unknown Customer',
         customerEmail: customer?.email || '',
@@ -851,7 +1108,9 @@ export async function getFullDashboardSnapshot(businessId: string) {
 
     const enrichedWhatsappLogs = whatsappLogList.map((log) => {
       const customer = customerMap.get(log.customerId);
-      const fp = log.failedPaymentId ? failedPaymentMap.get(log.failedPaymentId) : undefined;
+      const fp = log.failedPaymentId
+        ? failedPaymentMap.get(log.failedPaymentId)
+        : undefined;
       return {
         ...log,
         customerName: customer?.name || 'Unknown Customer',
@@ -863,6 +1122,20 @@ export async function getFullDashboardSnapshot(businessId: string) {
 
     return {
       business,
+      securityConfig: {
+        demoModeEnabled: isDemoModeAllowed(),
+        mockProvidersEnabled: isMockProvidersEnabled(),
+        paystackConfigured: isConfiguredSecret(process.env.PAYSTACK_SECRET_KEY),
+        flutterwaveConfigured:
+          isConfiguredSecret(process.env.FLW_SECRET_KEY) &&
+          isConfiguredSecret(process.env.FLW_SECRET_HASH),
+        metaWhatsappConfigured:
+          isConfiguredSecret(process.env.META_WHATSAPP_ACCESS_TOKEN) &&
+          isConfiguredSecret(process.env.META_WHATSAPP_PHONE_NUMBER_ID),
+        termiiConfigured:
+          isConfiguredSecret(process.env.TERMII_API_KEY) &&
+          isConfiguredSecret(process.env.TERMII_DEVICE_ID),
+      },
       metrics: {
         totalFailedRevenue,
         totalRecoveredRevenue,
@@ -886,25 +1159,40 @@ export async function getFullDashboardSnapshot(businessId: string) {
   }
 }
 
+/**
+ * PHASE 1 SECURITY HARDENING — OBJECTIVE 7:
+ * Strict whitelisted field updates to prevent mass-assignment or tenant column tampering.
+ */
+export interface ValidatedSettingsUpdate {
+  name: string;
+  phone: string;
+  paystackEnabled: boolean;
+  flutterwaveEnabled: boolean;
+  whatsappProvider: 'META' | 'TERMII';
+  whatsappTemplateImmediate: string;
+  whatsappTemplate24h: string;
+  whatsappTemplate72h: string;
+  retryLinkExpiryHours: number;
+}
+
 export async function updateBusinessSettings(
   businessId: string,
-  updates: {
-    name?: string;
-    phone?: string;
-    paystackEnabled?: boolean;
-    flutterwaveEnabled?: boolean;
-    whatsappProvider?: string;
-    whatsappTemplateImmediate?: string;
-    whatsappTemplate24h?: string;
-    whatsappTemplate72h?: string;
-    retryLinkExpiryHours?: number;
-  }
+  updates: ValidatedSettingsUpdate
 ) {
   try {
+    const normalizedPhone = normalizeNigerianPhone(updates.phone);
     const [updated] = await db
       .update(businesses)
       .set({
-        ...updates,
+        name: updates.name.trim(),
+        phone: normalizedPhone,
+        paystackEnabled: Boolean(updates.paystackEnabled),
+        flutterwaveEnabled: Boolean(updates.flutterwaveEnabled),
+        whatsappProvider: updates.whatsappProvider,
+        whatsappTemplateImmediate: updates.whatsappTemplateImmediate.trim(),
+        whatsappTemplate24h: updates.whatsappTemplate24h.trim(),
+        whatsappTemplate72h: updates.whatsappTemplate72h.trim(),
+        retryLinkExpiryHours: Number(updates.retryLinkExpiryHours),
         updatedAt: new Date(),
       })
       .where(eq(businesses.id, businessId))
@@ -916,18 +1204,61 @@ export async function updateBusinessSettings(
   }
 }
 
+/**
+ * PHASE 1 SECURITY HARDENING — OBJECTIVE 8:
+ * WhatsApp Opt-In Governance:
+ * 1. Updates whatsapp_opt_in and audit timestamp whatsapp_opt_in_updated_at.
+ * 2. When opt-in is revoked (false), immediately cancels all QUEUED WhatsApp sequence logs
+ *    for this customer so no scheduled reminders can fire.
+ */
 export async function toggleCustomerOptIn(
   businessId: string,
   customerId: string,
   whatsappOptIn: boolean
 ) {
   try {
+    const now = new Date();
     const [updated] = await db
       .update(customers)
-      .set({ whatsappOptIn, updatedAt: new Date() })
-      .where(and(eq(customers.id, customerId), eq(customers.businessId, businessId)))
+      .set({
+        whatsappOptIn,
+        whatsappOptInUpdatedAt: now,
+        updatedAt: now,
+      })
+      .where(
+        and(eq(customers.id, customerId), eq(customers.businessId, businessId))
+      )
       .returning();
-    return updated;
+
+    if (!updated) {
+      throw new Error('Customer not found in tenant workspace');
+    }
+
+    let cancelledQueuedCount = 0;
+    if (!whatsappOptIn) {
+      const cancelled = await db
+        .update(whatsappLogs)
+        .set({
+          status: 'CANCELLED',
+          errorCode: 'OPT_IN_REVOKED',
+          errorMessage:
+            'Cancelled automatically: Customer revoked WhatsApp opt-in consent.',
+        })
+        .where(
+          and(
+            eq(whatsappLogs.businessId, businessId),
+            eq(whatsappLogs.customerId, customerId),
+            eq(whatsappLogs.status, 'QUEUED')
+          )
+        )
+        .returning();
+      cancelledQueuedCount = cancelled.length;
+    }
+
+    return {
+      customer: updated,
+      cancelledQueuedCount,
+    };
   } catch (error) {
     console.error('Database query failed in toggleCustomerOptIn:', error);
     throw new Error('Failed to update customer WhatsApp opt-in status.', {

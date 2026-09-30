@@ -2,7 +2,14 @@ export type PaymentProvider = 'PAYSTACK' | 'FLUTTERWAVE';
 export type SubscriptionStatus = 'ACTIVE' | 'PAST_DUE' | 'CANCELLED' | 'EXPIRED' | 'RECOVERED';
 export type FailedPaymentStatus = 'PENDING' | 'RECOVERED' | 'EXPIRED' | 'CANCELLED';
 export type RecoveryStatus = 'ACTIVE' | 'RECOVERED' | 'STOPPED' | 'EXPIRED';
-export type MessageStatus = 'QUEUED' | 'SENT' | 'DELIVERED' | 'READ' | 'FAILED' | 'CANCELLED';
+export type MessageStatus =
+  | 'QUEUED'
+  | 'SENT'
+  | 'DELIVERED'
+  | 'READ'
+  | 'FAILED'
+  | 'NOT_CONFIGURED'
+  | 'CANCELLED';
 
 export interface Business {
   id: string;
@@ -12,6 +19,7 @@ export interface Business {
   phone: string | null;
   currency: string;
   timezone: string;
+  webhookToken: string | null;
   paystackEnabled: boolean;
   flutterwaveEnabled: boolean;
   whatsappProvider: 'META' | 'TERMII';
@@ -31,6 +39,7 @@ export interface Customer {
   email: string | null;
   phone: string;
   whatsappOptIn: boolean;
+  whatsappOptInUpdatedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -92,6 +101,8 @@ export interface FailedPaymentItem {
   status: FailedPaymentStatus;
   recoveryStatus: RecoveryStatus;
   recoveryToken: string | null;
+  recoveryTokenHash: string | null;
+  recoveryTokenUsedAt: string | null;
   failedAt: string;
   recoveredAt: string | null;
   expiresAt: string | null;
@@ -130,8 +141,18 @@ export interface DashboardMetrics {
   customersWithFailedCount: number;
 }
 
+export interface SecurityRuntimeConfig {
+  demoModeEnabled: boolean;
+  mockProvidersEnabled: boolean;
+  paystackConfigured: boolean;
+  flutterwaveConfigured: boolean;
+  metaWhatsappConfigured: boolean;
+  termiiConfigured: boolean;
+}
+
 export interface DashboardSnapshot {
   business: Business;
+  securityConfig?: SecurityRuntimeConfig;
   metrics: DashboardMetrics;
   customers: Customer[];
   subscriptions: SubscriptionItem[];
