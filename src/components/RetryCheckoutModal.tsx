@@ -145,9 +145,13 @@ export const RetryCheckoutModal: React.FC<RetryCheckoutModalProps> = ({
 
         <div className="p-6 space-y-6">
           {(payment.providerReference?.startsWith('ASUKU-TEST-FAILED-') ||
-            payment.customerName.includes('ASUKU TEST CUSTOMER')) && (
+            payment.providerReference?.startsWith('ASUKU-FLUTTERWAVE-SANDBOX-') ||
+            payment.customerName.includes('ASUKU TEST CUSTOMER') ||
+            payment.customerName.includes('ASUKU FLUTTERWAVE SANDBOX TEST')) && (
             <div className="border border-amber-800/60 bg-amber-950/30 p-3 text-xs text-amber-300 font-mono-tabular">
-              DEVELOPMENT / TEST RECORD ({payment.providerReference}) — Isolated local test record. No card was charged and no live Paystack, Flutterwave, or WhatsApp API was contacted.
+              {payment.providerReference?.startsWith('ASUKU-FLUTTERWAVE-SANDBOX-')
+                ? `FLUTTERWAVE SANDBOX TEST (${payment.providerReference}) — ASUKU Revenue Recovery — Flutterwave Sandbox Verification (NGN 1,000.00).`
+                : `DEVELOPMENT / TEST RECORD (${payment.providerReference}) — Isolated local test record. No card was charged and no live Paystack, Flutterwave, or WhatsApp API was contacted.`}
             </div>
           )}
           {/* Amount & Plan Summary */}

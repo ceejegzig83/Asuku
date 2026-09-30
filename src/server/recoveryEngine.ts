@@ -569,23 +569,25 @@ export async function processWebhookAndOrchestrateRecovery(
         };
       }
 
-      // Verify exact amount and currency integrity
+      // Verify exact amount and currency integrity (comparing integer minor units / kobo to avoid floating-point drift)
       const expectedAmount = Number(targetPayment.amount || 0);
+      const expectedMinor = Math.round(expectedAmount * 100);
       const expectedCurrency = (targetPayment.currency || 'NGN').toUpperCase();
       const webhookAmount =
         input.amountNaira !== undefined ? Number(input.amountNaira) : NaN;
+      const webhookMinor = Math.round(webhookAmount * 100);
       const webhookCurrency = (input.currency || 'NGN').toUpperCase();
 
       if (
         Number.isNaN(webhookAmount) ||
         webhookCurrency !== expectedCurrency ||
-        webhookAmount < expectedAmount
+        webhookMinor !== expectedMinor
       ) {
         return {
           status: 'PAYMENT_VERIFICATION_MISMATCH',
           idempotent: false,
           webhookEvent: savedWebhook,
-          message: `Security Integrity Check Failed: Webhook amount/currency (${webhookCurrency} ${webhookAmount}) does not satisfy pending failed payment (${expectedCurrency} ${expectedAmount}) for reference ${targetPayment.providerReference}.`,
+          message: `Security Integrity Check Failed: Webhook amount/currency (${webhookCurrency} ${webhookAmount}) does not match exact pending failed payment (${expectedCurrency} ${expectedAmount}) for reference ${targetPayment.providerReference}.`,
         };
       }
 

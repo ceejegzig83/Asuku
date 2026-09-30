@@ -188,6 +188,21 @@ export function getFlutterwaveSecretKey(): string | undefined {
   return undefined;
 }
 
+export function getFlutterwaveKeyMode(
+  secretKey?: string
+): 'TEST' | 'LIVE' | 'NOT_CONFIGURED' {
+  const resolved = secretKey !== undefined ? secretKey : getFlutterwaveSecretKey();
+  if (!isConfiguredSecret(resolved)) return 'NOT_CONFIGURED';
+  const trimmed = resolved!.trim();
+  if (
+    trimmed.startsWith('FLWSECK_LIVE') ||
+    (trimmed.startsWith('FLWSECK-') && !trimmed.startsWith('FLWSECK_TEST'))
+  ) {
+    return 'LIVE';
+  }
+  return 'TEST';
+}
+
 export function getFlutterwaveSecretHash(): string | undefined {
   if (isConfiguredSecret(process.env.FLW_SECRET_HASH)) {
     return process.env.FLW_SECRET_HASH!.trim();
@@ -198,19 +213,35 @@ export function getFlutterwaveSecretHash(): string | undefined {
   return undefined;
 }
 
+export function getFlutterwavePublicKey(): string | undefined {
+  if (isConfiguredSecret(process.env.FLW_PUBLIC_KEY)) {
+    return process.env.FLW_PUBLIC_KEY!.trim();
+  }
+  if (isConfiguredSecret(process.env.FLUTTERWAVE_PUBLIC_KEY)) {
+    return process.env.FLUTTERWAVE_PUBLIC_KEY!.trim();
+  }
+  return undefined;
+}
+
 export interface ProviderHealthStatus {
   provider: 'PAYSTACK' | 'FLUTTERWAVE' | 'META' | 'TERMII';
   category: 'PAYMENT' | 'WHATSAPP';
   status: 'CONFIGURED' | 'NOT_CONFIGURED';
   keyMode?: 'TEST' | 'LIVE' | 'NOT_CONFIGURED';
   webhookConfigured?: boolean;
+  publicKeyConfigured?: boolean;
 }
 
 export function getProvidersHealthReport() {
   const paystackConfigured = isConfiguredSecret(process.env.PAYSTACK_SECRET_KEY);
   const paystackKeyMode = getPaystackKeyMode(process.env.PAYSTACK_SECRET_KEY);
+  const paystackPubConfigured = isConfiguredSecret(
+    process.env.PAYSTACK_PUBLIC_KEY
+  );
   const flwSecretConfigured = Boolean(getFlutterwaveSecretKey());
+  const flwKeyMode = getFlutterwaveKeyMode();
   const flwHashConfigured = Boolean(getFlutterwaveSecretHash());
+  const flwPubConfigured = Boolean(getFlutterwavePublicKey());
   const metaConfigured =
     isConfiguredSecret(process.env.META_WHATSAPP_ACCESS_TOKEN) &&
     isConfiguredSecret(process.env.META_WHATSAPP_PHONE_NUMBER_ID);
@@ -225,15 +256,15 @@ export function getProvidersHealthReport() {
       status: paystackConfigured ? 'CONFIGURED' : 'NOT_CONFIGURED',
       keyMode: paystackKeyMode,
       webhookConfigured: paystackConfigured,
+      publicKeyConfigured: paystackPubConfigured,
     },
     FLUTTERWAVE: {
       provider: 'FLUTTERWAVE',
       category: 'PAYMENT',
-      status:
-        flwSecretConfigured && flwHashConfigured
-          ? 'CONFIGURED'
-          : 'NOT_CONFIGURED',
+      status: flwSecretConfigured ? 'CONFIGURED' : 'NOT_CONFIGURED',
+      keyMode: flwKeyMode,
       webhookConfigured: flwHashConfigured,
+      publicKeyConfigured: flwPubConfigured,
     },
     META: {
       provider: 'META',
@@ -483,6 +514,22 @@ export class PaystackPaymentProvider implements PaymentProvider {
       };
     }
 
+    if (getPaystackKeyMode(secretKey) === 'TEST' && !isSandboxEnvironment()) {
+      return {
+        initialized: false,
+        status: 'FAILED',
+        provider: 'PAYSTACK',
+        reference,
+        amountMinor,
+        amountNaira,
+        currency,
+        authorizationUrl: null,
+        errorCode: 'PAYSTACK_TEST_KEY_FORBIDDEN_IN_PRODUCTION',
+        errorMessage:
+          'Paystack test secret key (sk_test_*) is forbidden in production mode.',
+      };
+    }
+
     try {
       const res = await this.fetchFn(
         'https://api.paystack.co/transaction/initialize',
@@ -613,6 +660,19 @@ export class PaystackPaymentProvider implements PaymentProvider {
       };
     }
 
+    if (getPaystackKeyMode(secretKey) === 'TEST' && !isSandboxEnvironment()) {
+      return {
+        verified: false,
+        status: 'FAILED',
+        normalizedStatus: 'UNKNOWN',
+        provider: 'PAYSTACK',
+        reference,
+        errorCode: 'PAYSTACK_TEST_KEY_FORBIDDEN_IN_PRODUCTION',
+        errorMessage:
+          'Paystack test secret key (sk_test_*) is forbidden in production mode.',
+      };
+    }
+
     try {
       const res = await this.fetchFn(
         `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,
@@ -711,7 +771,7 @@ export class PaystackPaymentProvider implements PaymentProvider {
         };
       }
 
-      if (paidMinor < expectedMinor) {
+      if (paidMinor !== expectedMinor) {
         return {
           verified: false,
           status: 'MISMATCH',
@@ -722,7 +782,7 @@ export class PaystackPaymentProvider implements PaymentProvider {
           amountNaira: paidNaira,
           currency: paidCurrency,
           errorCode: 'AMOUNT_OR_CURRENCY_MISMATCH',
-          errorMessage: `Verified transaction (${paidCurrency} ${paidNaira}) does not match required (${expectedCurrency} ${expectedNaira}).`,
+          errorMessage: `Verified transaction (${paidCurrency} ${paidNaira}) does not match required exact amount (${expectedCurrency} ${expectedNaira}).`,
         };
       }
 
@@ -809,6 +869,38 @@ export class FlutterwavePaymentProvider implements PaymentProvider {
         errorCode: 'FLUTTERWAVE_NOT_CONFIGURED',
         errorMessage:
           'Flutterwave secret key (FLW_SECRET_KEY / FLUTTERWAVE_SECRET_KEY) is not configured. Cannot initialize Flutterwave checkout.',
+      };
+    }
+
+    if (getFlutterwaveKeyMode(flwSecret) === 'LIVE' && isSandboxEnvironment()) {
+      return {
+        initialized: false,
+        status: 'FAILED',
+        provider: 'FLUTTERWAVE',
+        reference,
+        amountMinor,
+        amountNaira,
+        currency,
+        authorizationUrl: null,
+        errorCode: 'FLW_LIVE_KEY_FORBIDDEN_IN_SANDBOX',
+        errorMessage:
+          'Flutterwave live secret key (FLWSECK-*) is forbidden in development/sandbox mode. Use a Flutterwave test secret key (FLWSECK_TEST-*).',
+      };
+    }
+
+    if (getFlutterwaveKeyMode(flwSecret) === 'TEST' && !isSandboxEnvironment()) {
+      return {
+        initialized: false,
+        status: 'FAILED',
+        provider: 'FLUTTERWAVE',
+        reference,
+        amountMinor,
+        amountNaira,
+        currency,
+        authorizationUrl: null,
+        errorCode: 'FLW_TEST_KEY_FORBIDDEN_IN_PRODUCTION',
+        errorMessage:
+          'Flutterwave test secret key (FLWSECK_TEST-*) is forbidden in production mode.',
       };
     }
 
@@ -927,6 +1019,32 @@ export class FlutterwavePaymentProvider implements PaymentProvider {
       };
     }
 
+    if (getFlutterwaveKeyMode(flwSecret) === 'LIVE' && isSandboxEnvironment()) {
+      return {
+        verified: false,
+        status: 'FAILED',
+        normalizedStatus: 'UNKNOWN',
+        provider: 'FLUTTERWAVE',
+        reference,
+        errorCode: 'FLW_LIVE_KEY_FORBIDDEN_IN_SANDBOX',
+        errorMessage:
+          'Flutterwave live secret key (FLWSECK-*) is forbidden in development/sandbox mode. Use a Flutterwave test secret key (FLWSECK_TEST-*).',
+      };
+    }
+
+    if (getFlutterwaveKeyMode(flwSecret) === 'TEST' && !isSandboxEnvironment()) {
+      return {
+        verified: false,
+        status: 'FAILED',
+        normalizedStatus: 'UNKNOWN',
+        provider: 'FLUTTERWAVE',
+        reference,
+        errorCode: 'FLW_TEST_KEY_FORBIDDEN_IN_PRODUCTION',
+        errorMessage:
+          'Flutterwave test secret key (FLWSECK_TEST-*) is forbidden in production mode.',
+      };
+    }
+
     try {
       const res = await this.fetchFn(
         `https://api.flutterwave.com/v3/transactions/verify_by_reference?tx_ref=${encodeURIComponent(
@@ -1026,7 +1144,7 @@ export class FlutterwavePaymentProvider implements PaymentProvider {
         };
       }
 
-      if (paidMinor < expectedMinor) {
+      if (paidMinor !== expectedMinor) {
         return {
           verified: false,
           status: 'MISMATCH',
@@ -1037,7 +1155,7 @@ export class FlutterwavePaymentProvider implements PaymentProvider {
           amountNaira: paidNaira,
           currency: paidCurrency,
           errorCode: 'AMOUNT_OR_CURRENCY_MISMATCH',
-          errorMessage: `Verified transaction (${paidCurrency} ${paidNaira}) does not match required (${expectedCurrency} ${expectedNaira}).`,
+          errorMessage: `Verified transaction (${paidCurrency} ${paidNaira}) does not match required exact amount (${expectedCurrency} ${expectedNaira}).`,
         };
       }
 

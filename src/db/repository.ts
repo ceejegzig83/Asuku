@@ -227,10 +227,134 @@ export async function ensureDevTestFailedPayment(businessId: string) {
     }
 
     await ensureSecondDevTestFailedPayment(businessId, firstTestPayment?.failedAt);
+    await ensureFlutterwaveSandboxTestFailedPayment(
+      businessId,
+      firstTestPayment?.failedAt
+    );
 
     return firstTestPayment;
   } catch (error) {
     console.error('Error in ensureDevTestFailedPayment:', error);
+    return null;
+  }
+}
+
+/**
+ * Development-only helper: Creates the dedicated isolated Flutterwave Sandbox test record
+ * (ASUKU-FLUTTERWAVE-SANDBOX-001 / ASUKU FLUTTERWAVE SANDBOX TEST / NGN 1,000.00)
+ * for Phase 2B Flutterwave Sandbox Verification.
+ * - Stores ONLY SHA-256 recovery_token_hash (plaintext recovery_token is NULL)
+ * - Keeps whatsappOptIn = false so no live WhatsApp message is sent during payment testing
+ */
+export async function ensureFlutterwaveSandboxTestFailedPayment(
+  businessId: string,
+  firstRecordFailedAt?: Date | null
+) {
+  try {
+    const existingFlwTest = await db
+      .select()
+      .from(failedPayments)
+      .where(
+        and(
+          eq(failedPayments.businessId, businessId),
+          eq(failedPayments.providerReference, 'ASUKU-FLUTTERWAVE-SANDBOX-001')
+        )
+      );
+
+    if (existingFlwTest.length > 0) {
+      return existingFlwTest[0];
+    }
+
+    const existingFlwCustomer = await db
+      .select()
+      .from(customers)
+      .where(
+        and(
+          eq(customers.businessId, businessId),
+          eq(customers.externalCustomerId, 'CUS_ASUKU_FLW_SANDBOX_001')
+        )
+      );
+
+    let flwCustomer = existingFlwCustomer[0];
+    if (!flwCustomer) {
+      const [createdFlwCustomer] = await db
+        .insert(customers)
+        .values({
+          businessId,
+          externalCustomerId: 'CUS_ASUKU_FLW_SANDBOX_001',
+          name: 'ASUKU FLUTTERWAVE SANDBOX TEST',
+          email: 'flw-sandbox-test@asuku.test',
+          phone: '+2348000000003',
+          whatsappOptIn: false,
+        })
+        .returning();
+      flwCustomer = createdFlwCustomer;
+    }
+
+    const flwSubProviderId = `SUB_ASUKU_FLW_SBX_${businessId.slice(0, 8)}`;
+    const existingFlwSub = await db
+      .select()
+      .from(subscriptions)
+      .where(
+        and(
+          eq(subscriptions.businessId, businessId),
+          eq(subscriptions.providerSubscriptionId, flwSubProviderId)
+        )
+      );
+
+    let flwSubscription = existingFlwSub[0];
+    const now = new Date();
+    if (!flwSubscription) {
+      const [createdFlwSub] = await db
+        .insert(subscriptions)
+        .values({
+          businessId,
+          customerId: flwCustomer.id,
+          provider: 'FLUTTERWAVE',
+          providerSubscriptionId: flwSubProviderId,
+          planName: 'ASUKU Revenue Recovery — Flutterwave Sandbox Verification',
+          amount: '1000.00',
+          currency: 'NGN',
+          status: 'PAST_DUE',
+          currentPeriodStart: new Date(now.getTime() - 30 * 86400000),
+          currentPeriodEnd: now,
+        })
+        .returning();
+      flwSubscription = createdFlwSub;
+    }
+
+    const rawRecoveryToken = `asuku_${crypto.randomBytes(32).toString('base64url')}`;
+    const recoveryTokenHash = hashRecoveryToken(rawRecoveryToken);
+    const failedAt = firstRecordFailedAt
+      ? new Date(new Date(firstRecordFailedAt).getTime() + 60 * 1000)
+      : now;
+    const expiresAt = new Date(now.getTime() + 168 * 3600 * 1000);
+
+    const [createdFlwPayment] = await db
+      .insert(failedPayments)
+      .values({
+        businessId,
+        customerId: flwCustomer.id,
+        subscriptionId: flwSubscription.id,
+        provider: 'FLUTTERWAVE',
+        providerTransactionId: 'FLW-SANDBOX-TEST-001',
+        providerReference: 'ASUKU-FLUTTERWAVE-SANDBOX-001',
+        amount: '1000.00',
+        currency: 'NGN',
+        failureReason:
+          '[FLUTTERWAVE SANDBOX TEST] ASUKU Revenue Recovery — Flutterwave Sandbox Verification',
+        status: 'PENDING',
+        recoveryStatus: 'ACTIVE',
+        recoveryToken: null, // Never store plaintext token
+        recoveryTokenHash,
+        failedAt,
+        expiresAt,
+      })
+      .returning();
+
+    return createdFlwPayment;
+  } catch (error) {
+    console.error('Error in ensureFlutterwaveSandboxTestFailedPayment:', error);
     return null;
   }
 }

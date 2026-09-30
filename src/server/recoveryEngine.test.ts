@@ -9,10 +9,12 @@ import {
   customers,
   failedPayments,
   subscriptions,
+  webhookEvents,
   whatsappLogs,
 } from '../db/schema.ts';
 import {
   FlutterwavePaymentProvider,
+  getFlutterwaveKeyMode,
   getPaymentProvider,
   getProvidersHealthReport,
   getWhatsAppProvider,
@@ -31,12 +33,16 @@ import {
   getRecoveryAttemptByToken,
   initializeMerchantPaymentRetry,
   initializeRecoveryPaymentByToken,
+  issueOneTimeRecoveryToken,
   markPaymentRecoveredAndCancelQueue,
   processWebhookAndOrchestrateRecovery,
   resolveWebhookTenant,
   verifyAndCompleteRecoveryByToken,
 } from './recoveryEngine.ts';
-import { toggleCustomerOptIn } from '../db/repository.ts';
+import {
+  getFullDashboardSnapshot,
+  toggleCustomerOptIn,
+} from '../db/repository.ts';
 
 describe('Phase 1 Step 5B — Atomic Recovery Token Consumption & Payment Integrity Tests', () => {
   let testBusinessId: string;
@@ -986,5 +992,422 @@ describe('Phase 1 Step 5B — Atomic Recovery Token Consumption & Payment Integr
       false
     );
     assert.equal(revOutcome.customer.whatsappOptIn, false);
+  });
+
+  it('PHASE 2B FLUTTERWAVE SANDBOX VERIFICATION: Isolated ASUKU-FLUTTERWAVE-SANDBOX-001 (NGN 1,000.00), key-mode guards, exact reference/amount/currency/status, webhooks, tenant isolation, atomic recovery & cleanup', async () => {
+    // 1. Verify current runtime environment has no live or configured Flutterwave keys
+    const initialHealth = getProvidersHealthReport();
+    assert.equal(initialHealth.providers.FLUTTERWAVE.status, 'NOT_CONFIGURED');
+    assert.equal(initialHealth.providers.FLUTTERWAVE.keyMode, 'NOT_CONFIGURED');
+
+    const suffix = crypto.randomBytes(4).toString('hex');
+    // Create Tenant A and Tenant B for strict cross-tenant isolation testing
+    const [tenantA] = await db
+      .insert(businesses)
+      .values({
+        ownerUid: `flw-sbx-tenant-a-${suffix}`,
+        name: `ASUKU FLW Sandbox Tenant A ${suffix}`,
+        email: `flw-tenant-a-${suffix}@asuku-test.internal`,
+        phone: '+2348000001111',
+        webhookToken: `wh_flw_a_${suffix}`,
+        paystackEnabled: false,
+        flutterwaveEnabled: true,
+        whatsappProvider: 'META',
+      })
+      .returning();
+
+    const [tenantB] = await db
+      .insert(businesses)
+      .values({
+        ownerUid: `flw-sbx-tenant-b-${suffix}`,
+        name: `ASUKU FLW Sandbox Tenant B ${suffix}`,
+        email: `flw-tenant-b-${suffix}@asuku-test.internal`,
+        phone: '+2348000002222',
+        webhookToken: `wh_flw_b_${suffix}`,
+        paystackEnabled: false,
+        flutterwaveEnabled: true,
+        whatsappProvider: 'META',
+      })
+      .returning();
+
+    const [flwCustomer] = await db
+      .insert(customers)
+      .values({
+        businessId: tenantA.id,
+        name: 'ASUKU FLUTTERWAVE SANDBOX TEST',
+        email: `flw-sandbox-${suffix}@asuku-test.internal`,
+        phone: '+2348000003333',
+        whatsappOptIn: false,
+      })
+      .returning();
+
+    const [flwSubscription] = await db
+      .insert(subscriptions)
+      .values({
+        businessId: tenantA.id,
+        customerId: flwCustomer.id,
+        provider: 'FLUTTERWAVE',
+        providerSubscriptionId: `SUB_FLW_SBX_${suffix}`,
+        planName: 'ASUKU Revenue Recovery — Flutterwave Sandbox Verification',
+        amount: '1000.00',
+        currency: 'NGN',
+        status: 'PAST_DUE',
+      })
+      .returning();
+
+    const rawToken = `asuku_${crypto.randomBytes(32).toString('base64url')}`;
+    const tokenHash = hashRecoveryToken(rawToken);
+    const flwReference = 'ASUKU-FLUTTERWAVE-SANDBOX-001';
+
+    const [flwPayment] = await db
+      .insert(failedPayments)
+      .values({
+        businessId: tenantA.id,
+        subscriptionId: flwSubscription.id,
+        customerId: flwCustomer.id,
+        provider: 'FLUTTERWAVE',
+        providerReference: flwReference,
+        amount: '1000.00',
+        currency: 'NGN',
+        failureReason: 'FLUTTERWAVE SANDBOX TEST — Card Declined',
+        status: 'PENDING',
+        recoveryStatus: 'ACTIVE',
+        recoveryToken: null,
+        recoveryTokenHash: tokenHash,
+        recoveryTokenUsedAt: null,
+        expiresAt: new Date(Date.now() + 7 * 24 * 3600 * 1000),
+      })
+      .returning();
+
+    await db.insert(whatsappLogs).values([
+      {
+        businessId: tenantA.id,
+        failedPaymentId: flwPayment.id,
+        customerId: flwCustomer.id,
+        provider: 'META',
+        phoneNumber: '+2348000003333',
+        sequenceStep: 2,
+        templateName: 'payment_reminder_24h',
+        status: 'QUEUED',
+        scheduledAt: new Date(Date.now() + 24 * 3600 * 1000),
+      },
+      {
+        businessId: tenantA.id,
+        failedPaymentId: flwPayment.id,
+        customerId: flwCustomer.id,
+        provider: 'META',
+        phoneNumber: '+2348000003333',
+        sequenceStep: 3,
+        templateName: 'payment_final_notice_72h',
+        status: 'QUEUED',
+        scheduledAt: new Date(Date.now() + 72 * 3600 * 1000),
+      },
+    ]);
+
+    try {
+      // 2. When Flutterwave credentials are NOT configured -> honest 503 NOT_CONFIGURED (no fake transaction)
+      const unconfInit = await initializeRecoveryPaymentByToken(rawToken);
+      assert.equal(unconfInit.httpStatus, 503);
+      assert.equal(unconfInit.status, 'NOT_CONFIGURED');
+      assert.equal(unconfInit.errorCode, 'FLUTTERWAVE_NOT_CONFIGURED');
+
+      const unconfVerify = await verifyAndCompleteRecoveryByToken(
+        rawToken,
+        flwReference
+      );
+      assert.equal(unconfVerify.httpStatus, 503);
+      assert.equal(unconfVerify.success, false);
+      assert.equal(unconfVerify.errorCode, 'FLUTTERWAVE_NOT_CONFIGURED');
+
+      // 3. Cross-tenant isolation: Tenant B cannot initialize or issue token for Tenant A's Flutterwave payment
+      const crossTenantInit = await initializeMerchantPaymentRetry(
+        tenantB.id,
+        flwPayment.id
+      );
+      assert.equal(crossTenantInit.httpStatus, 404);
+      assert.equal(crossTenantInit.initialized, false);
+
+      await assert.rejects(
+        async () => issueOneTimeRecoveryToken(tenantB.id, flwPayment.id),
+        /Failed to issue recovery token/
+      );
+
+      const tenantBSnap = await getFullDashboardSnapshot(tenantB.id);
+      assert.equal(tenantBSnap.failedPayments.length, 0);
+
+      // 4. Key-mode guardrails: Live Flutterwave key blocked in sandbox; Test key blocked in production
+      const origFlwKey = process.env.FLW_SECRET_KEY;
+      const origAsukuEnv = process.env.ASUKU_ENV;
+      try {
+        process.env.FLW_SECRET_KEY = 'FLWSECK-live_key_should_be_blocked';
+        assert.equal(getFlutterwaveKeyMode(), 'LIVE');
+        const liveBlockedInit = await initializeRecoveryPaymentByToken(rawToken);
+        assert.equal(liveBlockedInit.initialized, false);
+        assert.equal(
+          liveBlockedInit.errorCode,
+          'FLW_LIVE_KEY_FORBIDDEN_IN_SANDBOX'
+        );
+
+        process.env.FLW_SECRET_KEY = 'FLWSECK_TEST-sandbox_key_001';
+        process.env.ASUKU_ENV = 'production';
+        const testBlockedInProd = await initializeRecoveryPaymentByToken(rawToken);
+        assert.equal(testBlockedInProd.initialized, false);
+        assert.equal(
+          testBlockedInProd.errorCode,
+          'FLW_TEST_KEY_FORBIDDEN_IN_PRODUCTION'
+        );
+      } finally {
+        if (origAsukuEnv === undefined) delete process.env.ASUKU_ENV;
+        else process.env.ASUKU_ENV = origAsukuEnv;
+        if (origFlwKey === undefined) delete process.env.FLW_SECRET_KEY;
+        else process.env.FLW_SECRET_KEY = origFlwKey;
+      }
+
+      // 5. Adapter & Engine verification with ephemeral test key
+      process.env.FLW_SECRET_KEY = 'FLWSECK_TEST-ephemeral_verification_key';
+      try {
+        // Server-controlled initialization: NGN 1,000.00 -> 1000 Naira in FLW request & 100000 minor units internally
+        let capturedFlwPayload: Record<string, unknown> = {};
+        const flwInitRes = await initializeRecoveryPaymentByToken(rawToken, {
+          fetchFn: async (_url, init) => {
+            capturedFlwPayload = JSON.parse(String(init?.body || '{}'));
+            return new Response(
+              JSON.stringify({
+                status: 'success',
+                data: {
+                  link: 'https://checkout.flutterwave.com/v3/hosted/pay/flw_sbx_001',
+                },
+              }),
+              { status: 200 }
+            );
+          },
+        });
+        assert.equal(flwInitRes.httpStatus, 200);
+        assert.equal(flwInitRes.initialized, true);
+        assert.ok('reference' in flwInitRes);
+        assert.equal(flwInitRes.reference, flwReference);
+        assert.equal(flwInitRes.amountNaira, 1000);
+        assert.equal(flwInitRes.amountMinor, 100000);
+        assert.equal(flwInitRes.currency, 'NGN');
+        assert.equal(capturedFlwPayload.tx_ref, flwReference);
+        assert.equal(capturedFlwPayload.amount, 1000);
+        assert.equal(capturedFlwPayload.currency, 'NGN');
+
+        // Exact reference mismatch rejected (400 / 422)
+        const badRefClient = await verifyAndCompleteRecoveryByToken(
+          rawToken,
+          'ASUKU-FLUTTERWAVE-WRONG-REF'
+        );
+        assert.equal(badRefClient.httpStatus, 400);
+        assert.equal(badRefClient.success, false);
+
+        // Exact amount mismatch: NGN 999.00 vs expected NGN 1,000.00 -> REJECTED (422)
+        const underpaid999 = await verifyAndCompleteRecoveryByToken(
+          rawToken,
+          flwReference,
+          {
+            verifyTransactionFn: async (p) => {
+              const adapter = new FlutterwavePaymentProvider(async () =>
+                new Response(
+                  JSON.stringify({
+                    status: 'success',
+                    data: {
+                      id: 77101,
+                      status: 'successful',
+                      tx_ref: flwReference,
+                      amount: 999,
+                      currency: 'NGN',
+                    },
+                  }),
+                  { status: 200 }
+                )
+              );
+              return adapter.verifyPayment(p);
+            },
+          }
+        );
+        assert.equal(underpaid999.httpStatus, 422);
+        assert.equal(underpaid999.success, false);
+        assert.equal(underpaid999.errorCode, 'AMOUNT_OR_CURRENCY_MISMATCH');
+
+        // Kobo-vs-Naira confusion check: 100000 Naira vs expected 1000 Naira -> REJECTED (422)
+        const overpaidKoboConfusion = await verifyAndCompleteRecoveryByToken(
+          rawToken,
+          flwReference,
+          {
+            verifyTransactionFn: async (p) => {
+              const adapter = new FlutterwavePaymentProvider(async () =>
+                new Response(
+                  JSON.stringify({
+                    status: 'success',
+                    data: {
+                      id: 77102,
+                      status: 'successful',
+                      tx_ref: flwReference,
+                      amount: 100000,
+                      currency: 'NGN',
+                    },
+                  }),
+                  { status: 200 }
+                )
+              );
+              return adapter.verifyPayment(p);
+            },
+          }
+        );
+        assert.equal(overpaidKoboConfusion.httpStatus, 422);
+        assert.equal(overpaidKoboConfusion.success, false);
+        assert.equal(
+          overpaidKoboConfusion.errorCode,
+          'AMOUNT_OR_CURRENCY_MISMATCH'
+        );
+
+        // Currency mismatch: USD vs NGN -> REJECTED (422)
+        const wrongCurr = await verifyAndCompleteRecoveryByToken(
+          rawToken,
+          flwReference,
+          {
+            verifyTransactionFn: async (p) => {
+              const adapter = new FlutterwavePaymentProvider(async () =>
+                new Response(
+                  JSON.stringify({
+                    status: 'success',
+                    data: {
+                      id: 77103,
+                      status: 'successful',
+                      tx_ref: flwReference,
+                      amount: 1000,
+                      currency: 'USD',
+                    },
+                  }),
+                  { status: 200 }
+                )
+              );
+              return adapter.verifyPayment(p);
+            },
+          }
+        );
+        assert.equal(wrongCurr.httpStatus, 422);
+        assert.equal(wrongCurr.errorCode, 'AMOUNT_OR_CURRENCY_MISMATCH');
+
+        // Non-final / unsuccessful statuses (pending, failed, cancelled, abandoned, reversed) -> REJECTED
+        for (const nonFinalStatus of [
+          'pending',
+          'failed',
+          'cancelled',
+          'abandoned',
+          'reversed',
+        ]) {
+          const nonFinalAttempt = await verifyAndCompleteRecoveryByToken(
+            rawToken,
+            flwReference,
+            {
+              verifyTransactionFn: async (p) => {
+                const adapter = new FlutterwavePaymentProvider(async () =>
+                  new Response(
+                    JSON.stringify({
+                      status: 'success',
+                      data: {
+                        id: 77104,
+                        status: nonFinalStatus,
+                        tx_ref: flwReference,
+                        amount: 1000,
+                        currency: 'NGN',
+                      },
+                    }),
+                    { status: 200 }
+                  )
+                );
+                return adapter.verifyPayment(p);
+              },
+            }
+          );
+          assert.equal(nonFinalAttempt.httpStatus, 422);
+          assert.equal(nonFinalAttempt.success, false);
+        }
+
+        // Confirm payment is still PENDING and token is still unconsumed
+        const [stillPendingRow] = await db
+          .select()
+          .from(failedPayments)
+          .where(eq(failedPayments.id, flwPayment.id));
+        assert.equal(stillPendingRow.status, 'PENDING');
+        assert.equal(stillPendingRow.recoveryTokenUsedAt, null);
+
+        // Concurrent atomic recovery verification for NGN 1,000.00
+        const validFlwVerifyFn = async (p: {
+          reference: string;
+          expectedAmountNaira: number;
+          expectedCurrency: string;
+        }) => {
+          const adapter = new FlutterwavePaymentProvider(async () =>
+            new Response(
+              JSON.stringify({
+                status: 'success',
+                data: {
+                  id: 77999,
+                  status: 'successful',
+                  tx_ref: flwReference,
+                  amount: 1000,
+                  currency: 'NGN',
+                },
+              }),
+              { status: 200 }
+            )
+          );
+          return adapter.verifyPayment(p);
+        };
+
+        const [r1, r2] = await Promise.all([
+          verifyAndCompleteRecoveryByToken(rawToken, flwReference, {
+            verifyTransactionFn: validFlwVerifyFn,
+          }),
+          verifyAndCompleteRecoveryByToken(rawToken, flwReference, {
+            verifyTransactionFn: validFlwVerifyFn,
+          }),
+        ]);
+        const wins = [r1, r2].filter((r) => r.httpStatus === 200 && r.success);
+        const conflicts = [r1, r2].filter(
+          (r) => r.httpStatus === 409 && !r.success
+        );
+        assert.equal(wins.length, 1);
+        assert.equal(conflicts.length, 1);
+
+        // Queued WhatsApp jobs are CANCELLED and worker refuses to send
+        const flwLogs = await db
+          .select()
+          .from(whatsappLogs)
+          .where(eq(whatsappLogs.failedPaymentId, flwPayment.id));
+        assert.equal(flwLogs.length, 2);
+        assert.ok(flwLogs.every((l) => l.status === 'CANCELLED'));
+
+        // Dashboard reflects exact NGN 1,000.00 recovery
+        const snapAfter = await getFullDashboardSnapshot(tenantA.id);
+        assert.equal(snapAfter.metrics.totalFailedRevenue, 1000);
+        assert.equal(snapAfter.metrics.totalRecoveredRevenue, 1000);
+        assert.equal(snapAfter.metrics.pendingRecoveryRevenue, 0);
+        assert.equal(snapAfter.metrics.recoveredCount, 1);
+      } finally {
+        if (origFlwKey === undefined) delete process.env.FLW_SECRET_KEY;
+        else process.env.FLW_SECRET_KEY = origFlwKey;
+      }
+    } finally {
+      // 26. Cleanup temporary sandbox test records
+      await db
+        .delete(webhookEvents)
+        .where(eq(webhookEvents.businessId, tenantA.id));
+      await db
+        .delete(whatsappLogs)
+        .where(eq(whatsappLogs.businessId, tenantA.id));
+      await db
+        .delete(failedPayments)
+        .where(eq(failedPayments.businessId, tenantA.id));
+      await db
+        .delete(subscriptions)
+        .where(eq(subscriptions.businessId, tenantA.id));
+      await db.delete(customers).where(eq(customers.businessId, tenantA.id));
+      await db.delete(businesses).where(eq(businesses.id, tenantA.id));
+      await db.delete(businesses).where(eq(businesses.id, tenantB.id));
+    }
   });
 });

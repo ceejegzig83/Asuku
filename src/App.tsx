@@ -830,7 +830,13 @@ export default function App() {
                                 fp.providerReference?.startsWith(
                                   'ASUKU-TEST-FAILED-'
                                 ) ||
-                                fp.customerName.includes('ASUKU TEST CUSTOMER');
+                                fp.providerReference?.startsWith(
+                                  'ASUKU-FLUTTERWAVE-SANDBOX-'
+                                ) ||
+                                fp.customerName.includes('ASUKU TEST CUSTOMER') ||
+                                fp.customerName.includes(
+                                  'ASUKU FLUTTERWAVE SANDBOX TEST'
+                                );
                               return (
                               <tr
                                 key={fp.id}
@@ -1002,18 +1008,28 @@ export default function App() {
                       </div>
                     </div>
 
-                    {filteredFailedPayments.some((fp) =>
-                      fp.providerReference?.startsWith('ASUKU-TEST-FAILED-')
+                    {filteredFailedPayments.some(
+                      (fp) =>
+                        fp.providerReference?.startsWith(
+                          'ASUKU-TEST-FAILED-'
+                        ) ||
+                        fp.providerReference?.startsWith(
+                          'ASUKU-FLUTTERWAVE-SANDBOX-'
+                        )
                     ) && (
                       <div className="border border-amber-800/60 bg-amber-950/30 px-6 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
                         <div className="text-amber-300 font-medium">
-                          DEVELOPMENT / TEST RECORDS ACTIVE:{' '}
+                          DEVELOPMENT / SANDBOX TEST RECORDS ACTIVE:{' '}
                           <span className="font-mono-tabular text-white">
                             {filteredFailedPayments
-                              .filter((fp) =>
-                                fp.providerReference?.startsWith(
-                                  'ASUKU-TEST-FAILED-'
-                                )
+                              .filter(
+                                (fp) =>
+                                  fp.providerReference?.startsWith(
+                                    'ASUKU-TEST-FAILED-'
+                                  ) ||
+                                  fp.providerReference?.startsWith(
+                                    'ASUKU-FLUTTERWAVE-SANDBOX-'
+                                  )
                               )
                               .map(
                                 (fp) =>
@@ -1023,7 +1039,7 @@ export default function App() {
                           </span>
                         </div>
                         <div className="text-amber-400/90 font-mono-tabular">
-                          No Paystack/Flutterwave API called · No card charged · No WhatsApp sent · SHA-256 token hash only
+                          No live card charged · No WhatsApp sent · SHA-256 token hash only
                         </div>
                       </div>
                     )}
@@ -1057,7 +1073,13 @@ export default function App() {
                               fp.providerReference?.startsWith(
                                 'ASUKU-TEST-FAILED-'
                               ) ||
-                              fp.customerName.includes('ASUKU TEST CUSTOMER');
+                              fp.providerReference?.startsWith(
+                                'ASUKU-FLUTTERWAVE-SANDBOX-'
+                              ) ||
+                              fp.customerName.includes('ASUKU TEST CUSTOMER') ||
+                              fp.customerName.includes(
+                                'ASUKU FLUTTERWAVE SANDBOX TEST'
+                              );
                             return (
                             <tr
                               key={fp.id}
@@ -1073,7 +1095,11 @@ export default function App() {
                                 </div>
                                 {isDevTestRecord && (
                                   <div className="text-amber-400 font-mono-tabular mt-0.5">
-                                    DEVELOPMENT / TEST RECORD · NO LIVE CHARGE
+                                    {fp.providerReference?.startsWith(
+                                      'ASUKU-FLUTTERWAVE-SANDBOX-'
+                                    )
+                                      ? 'FLUTTERWAVE SANDBOX TEST · NO LIVE CHARGE'
+                                      : 'DEVELOPMENT / TEST RECORD · NO LIVE CHARGE'}
                                   </div>
                                 )}
                                 <div className="font-mono-tabular text-slate-400 mt-0.5">
